@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "driver/ledc.h"
 
 #include <rcl/rcl.h>
@@ -25,8 +26,13 @@
 #define UROS_PING_INTERVAL_MS 1000
 #define UROS_EXECUTOR_WAIT_MS 10
 
-#define TOOL_CHANGER_ATTACH_SERVO_ANGLE 25
-#define TOOL_CHANGER_DETACH_SERVO_ANGLE 60
+#define TOOL_CHANGER_ATTACH_SERVO_ANGLE 100
+#define TOOL_CHANGER_DETACH_SERVO_ANGLE 165
+
+#define LED_OK_PIN    GPIO_NUM_7
+#define LED_ERROR_PIN GPIO_NUM_15
+
+#define ERROR_FLAG_AGENT (1u << 0)
 
 #define SERVO_PWM_GPIO 8
 #define SERVO_MIN_PULSEWIDTH_US (500)
@@ -39,6 +45,40 @@ char command_subscriber_topic[TOPIC_BUFFER_SIZE];
 
 static const char *TAG = "tool_changer";
 static size_t uart_port = UART_NUM_1;
+
+static volatile uint32_t error_flags = 0;
+
+static void set_error_flag(uint32_t flag)
+{
+    error_flags |= flag;
+    gpio_set_level(LED_OK_PIN, 1);    // ok off
+    gpio_set_level(LED_ERROR_PIN, 0); // error on
+}
+
+static void clear_error_flag(uint32_t flag)
+{
+    error_flags &= ~flag;
+    if (error_flags == 0) {
+        gpio_set_level(LED_ERROR_PIN, 1); // error off
+        gpio_set_level(LED_OK_PIN, 0);    // ok on
+    }
+}
+
+void led_init(void)
+{
+    gpio_num_t leds[] = {LED_OK_PIN, LED_ERROR_PIN};
+    for (int i = 0; i < 2; i++) {
+        gpio_set_level(leds[i], 1); // drive high before enabling output to avoid glitch
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << leds[i]),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+    }
+}
 
 typedef enum
 {
@@ -182,6 +222,7 @@ void uros_task(void *arg)
             }
             else
             {
+                set_error_flag(ERROR_FLAG_AGENT);
                 vTaskDelay(pdMS_TO_TICKS(UROS_RECONNECT_DELAY_MS));
             }
             break;
@@ -196,12 +237,14 @@ void uros_task(void *arg)
             {
                 state = AGENT_CONNECTED;
                 last_ping_check_us = esp_timer_get_time();
+                clear_error_flag(ERROR_FLAG_AGENT);
                 ESP_LOGI(TAG, "Agent connected");
             }
             else
             {
                 ESP_LOGW(TAG, "Entity creation failed, retrying...");
                 destroy_micro_ros_entities(&support, &node, &executor);
+                set_error_flag(ERROR_FLAG_AGENT);
                 state = WAITING_AGENT;
                 vTaskDelay(pdMS_TO_TICKS(UROS_RECONNECT_DELAY_MS));
             }
@@ -230,6 +273,7 @@ void uros_task(void *arg)
         case AGENT_DISCONNECTED:
         {
             ESP_LOGW(TAG, "Agent disconnected, destroying entities...");
+            set_error_flag(ERROR_FLAG_AGENT);
             rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
             if (rmw_context != NULL)
             {
@@ -251,6 +295,9 @@ void uros_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting Setup...");
+
+    led_init();
+    clear_error_flag(0); // all clear → ok LED on
 
     servo_init();
 
